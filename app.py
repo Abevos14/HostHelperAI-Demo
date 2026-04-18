@@ -5,7 +5,7 @@ from io import BytesIO
 
 st.set_page_config(page_title="Host Helper AI", page_icon="🏠", layout="centered", initial_sidebar_state="expanded")
 
-APP_URL = "https://hosthelperai-demo.streamlit.app"
+APP_URL = "https://hostai-demo.streamlit.app"
 
 @st.cache_data(ttl=3600)
 def load_knowledge_base():
