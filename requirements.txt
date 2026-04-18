@@ -1,0 +1,7 @@
+streamlit
+gspread
+oauth2client
+google-generativeai
+python-dotenv
+twilio
+qrcode[pil]
