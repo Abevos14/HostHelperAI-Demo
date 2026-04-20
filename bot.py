@@ -13,7 +13,7 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 from datetime import datetime
 
-SPREADSHEET_NAME = "HostHelperAI"
+SPREADSHEET_NAME = "HostHelperAI Demo"
 LOG_SPREADSHEET_NAME = "Host Helper AI Log"
 CREDS_FILE = 'credentials.json'
 
