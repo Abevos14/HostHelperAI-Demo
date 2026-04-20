@@ -9,7 +9,7 @@ import os
 from datetime import datetime
 
 # --- Configuration ---
-SPREADSHEET_NAME = "HostHelperAI Demo"
+SPREADSHEET_NAME = "HostHelperAI"
 LOG_SPREADSHEET_NAME = "Host Helper AI Log"
 CREDS_FILE = 'credentials.json'
 
@@ -25,12 +25,6 @@ MODEL = 'gemini-2.5-flash'
 FALLBACK_RESPONSE = (
     "I'm sorry, I don't have that specific information. I will notify the host to help you with that."
 )
-def get_pin(kb_data):
-    """Extracts the PIN from the knowledge base string."""
-    for line in kb_data.splitlines():
-        if line.lower().startswith("pin:"):
-            return line.split(":", 1)[1].strip()
-    return None
 
 def get_gspread_client():
     scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
