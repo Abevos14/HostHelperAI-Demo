@@ -1,14 +1,18 @@
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-# --- Core Logic Functions (The Brain) ---
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import google.generativeai as genai
 import os
+import smtplib
+from email.mime.text import MIMEText
+from email.utils import formataddr
 from datetime import datetime
 
-# --- Configuration ---
 SPREADSHEET_NAME = "HostHelperAI"
 LOG_SPREADSHEET_NAME = "Host Helper AI Log"
 CREDS_FILE = 'credentials.json'
@@ -41,6 +45,47 @@ def get_gspread_client():
         return gspread.authorize(creds)
     return None
 
+def get_pin(kb_data):
+    """Extracts the PIN from the knowledge base string."""
+    for line in kb_data.splitlines():
+        if line.lower().startswith("pin:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+def send_email_alert(question):
+    """Sends an email to the host when a guest asks an unanswered question."""
+    print("[EMAIL DEBUG] send_email_alert called")
+    try:
+        import streamlit as st
+        gmail_user = st.secrets["GMAIL_USER"]
+        gmail_password = st.secrets["GMAIL_APP_PASSWORD"]
+        host_email = st.secrets["HOST_EMAIL"]
+
+        subject = "Host Helper AI - Unanswered Guest Question"
+        body = (
+            f"A guest just asked your property bot a question it couldn't answer.\n\n"
+            f"Question: \"{question.strip()}\"\n\n"
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"Consider adding this topic to your knowledge base so the bot can answer it next time.\n\n"
+            f"- Host Helper AI"
+        )
+
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = formataddr(("Host Helper AI", gmail_user))
+        msg['To'] = host_email
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(gmail_user, gmail_password)
+            server.send_message(msg)
+        print(f"[EMAIL SENT] to {host_email}")
+        return True
+    except Exception as e:
+        import traceback
+        print(f"[EMAIL ERROR] {e}")
+        print(traceback.format_exc())
+        return False
+
 def send_sms_alert(question):
     """Sends an SMS to the host when a guest asks an unanswered question."""
     print("[SMS DEBUG] send_sms_alert called")
@@ -50,8 +95,6 @@ def send_sms_alert(question):
         token = st.secrets["TWILIO_AUTH_TOKEN"]
         from_number = st.secrets["TWILIO_FROM"]
         to_number = st.secrets["HOST_PHONE"]
-        print(f"[SMS DEBUG] Got secrets. SID starts with: {str(sid)[:6]}")
-
         from twilio.rest import Client
         client = Client(sid, token)
         message = client.messages.create(
@@ -65,18 +108,9 @@ def send_sms_alert(question):
         import traceback
         print(f"[SMS ERROR] {e}")
         print(traceback.format_exc())
-        # Log error to Google Sheet
-        try:
-            client = get_gspread_client()
-            if client:
-                sheet = client.open(LOG_SPREADSHEET_NAME).sheet1
-                sheet.append_row(["SMS_ERROR", str(e)])
-        except Exception as e2:
-            print(f"[SHEET ERROR] {e2}")
         return False
 
 def log_unanswered_question(question):
-    """Logs questions to the Google Sheet and sends SMS alert."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = [timestamp, question.strip()]
     print(f"\n[HOST LOG] UNANSWERED: {question.strip()}")
@@ -87,11 +121,11 @@ def log_unanswered_question(question):
             sheet.append_row(log_entry)
     except Exception as e:
         print(f"[LOG ERROR] {e}")
-    result = send_sms_alert(question)
-    print(f"[SMS RESULT] Success: {result}")
+    email_result = send_email_alert(question)
+    sms_result = send_sms_alert(question)
+    print(f"[ALERT RESULT] Email: {email_result}, SMS: {sms_result}")
 
 def get_knowledge_base():
-    """Pulls all data from Google Sheets knowledge base."""
     try:
         client = get_gspread_client()
         if not client:
@@ -106,18 +140,14 @@ def get_knowledge_base():
         return f"ERROR: Failed to load knowledge base. Details: {e}"
 
 def ask_host_helper(question, kb_data, chat_history=None):
-    """Generates an AI response based on the Knowledge Base and conversation history."""
     if kb_data.startswith("ERROR"):
         return f"System Error: {kb_data}"
-
     if chat_history is None:
         chat_history = []
-
     history_text = ""
     for msg in chat_history:
         role = "Guest" if msg["role"] == "user" else "Assistant"
         history_text += f"{role}: {msg['content']}\n"
-
     system_prompt = (
         "You are a friendly, concise, and helpful AI assistant for a short-term rental guest. "
         "Your responses should be encouraging and direct. "
@@ -126,14 +156,12 @@ def ask_host_helper(question, kb_data, chat_history=None):
         "\n\n**EXCEPTION:** If the guest says 'Hi', 'Hello', 'Thanks', or 'Goodbye', respond politely and naturally WITHOUT using the knowledge base. "
         f"\n\nIf the user asks a specific question and the answer is not in the knowledge base, respond exactly with: '{FALLBACK_RESPONSE}'"
     )
-
     full_prompt = (
         f"{system_prompt}\n\n"
         f"KNOWLEDGE BASE:\n{kb_data}\n\n"
         f"CONVERSATION HISTORY:\n{history_text}\n"
         f"GUEST QUESTION: {question}"
     )
-
     try:
         response = genai.GenerativeModel(MODEL).generate_content(full_prompt)
         ai_response = response.text
