@@ -41,18 +41,6 @@ if "pending_prompt" not in st.session_state:
 knowledge_base = load_knowledge_base()
 kb_is_ready = not knowledge_base.startswith("ERROR")
 
-def process_prompt(prompt_text):
-    """Process a prompt (from chat input or button) and add response to history."""
-    st.session_state.messages.append({"role": "user", "content": prompt_text})
-    if kb_is_ready:
-        response = core.ask_host_helper(prompt_text, knowledge_base, chat_history=st.session_state.messages)
-        st.session_state.total_count += 1
-        if core.FALLBACK_RESPONSE in response:
-            st.session_state.unanswered_count += 1
-    else:
-        response = "System Error: KB not ready."
-    st.session_state.messages.append({"role": "assistant", "content": response})
-
 if not st.session_state.authenticated:
     st.markdown("<br><br>", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -113,34 +101,56 @@ else:
         st.download_button(label="Download QR Code", data=generate_qr_code(APP_URL), file_name="host_helper_qr.png", mime="image/png")
 
     # Show welcome and quick action buttons only if no chat yet
-    if not st.session_state.messages:
+    if not st.session_state.messages and not st.session_state.pending_prompt:
         st.markdown("### Quick questions to get you started:")
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("📶 WiFi Password", use_container_width=True, key="btn_wifi"):
-                process_prompt("What is the WiFi password?")
+                st.session_state.pending_prompt = "What is the WiFi password?"
                 st.rerun()
             if st.button("🏠 House Rules", use_container_width=True, key="btn_rules"):
-                process_prompt("What are the house rules?")
+                st.session_state.pending_prompt = "What are the house rules?"
                 st.rerun()
         with col_b:
             if st.button("🔑 Check-In Info", use_container_width=True, key="btn_checkin"):
-                process_prompt("How do I check in?")
+                st.session_state.pending_prompt = "How do I check in?"
                 st.rerun()
             if st.button("🍽️ Local Recs", use_container_width=True, key="btn_food"):
-                process_prompt("What are some good local restaurants?")
+                st.session_state.pending_prompt = "What are some good local restaurants?"
                 st.rerun()
         st.markdown("---")
         st.markdown("**Or type your own question below:**")
         st.chat_message("assistant", avatar="🏠").markdown("Hi there! I am your property assistant. Tap one of the quick questions above or just type your own — I am here 24/7 to help.")
-    else:
-        # Render full chat history
-        for message in st.session_state.messages:
-            avatar_icon = "🏠" if message["role"] == "assistant" else "👤"
-            with st.chat_message(message["role"], avatar=avatar_icon):
-                st.markdown(message["content"])
 
-    # Chat input - always at the bottom
-    if prompt := st.chat_input("Ask about WiFi, check-in, parking, anything..."):
-        process_prompt(prompt)
+    # Render existing chat history
+    for message in st.session_state.messages:
+        avatar_icon = "🏠" if message["role"] == "assistant" else "👤"
+        with st.chat_message(message["role"], avatar=avatar_icon):
+            st.markdown(message["content"])
+
+    # Get prompt from chat input or pending button click
+    chat_prompt = st.chat_input("Ask about WiFi, check-in, parking, anything...")
+    prompt = chat_prompt or st.session_state.pending_prompt
+
+    if prompt:
+        # Clear pending so it doesn't fire again on rerun
+        st.session_state.pending_prompt = None
+
+        # Add user message to history and display
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user", avatar="👤"):
+            st.markdown(prompt)
+
+        # Stream AI response
+        with st.chat_message("assistant", avatar="🏠"):
+            if kb_is_ready:
+                response = st.write_stream(core.ask_host_helper_stream(prompt, knowledge_base, chat_history=st.session_state.messages))
+                st.session_state.total_count += 1
+                if core.FALLBACK_RESPONSE in response:
+                    st.session_state.unanswered_count += 1
+            else:
+                response = "System Error: KB not ready."
+                st.markdown(response)
+
+        st.session_state.messages.append({"role": "assistant", "content": response})
         st.rerun()
