@@ -35,11 +35,23 @@ if "unanswered_count" not in st.session_state:
     st.session_state.unanswered_count = 0
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "quick_action" not in st.session_state:
-    st.session_state.quick_action = None
+if "pending_prompt" not in st.session_state:
+    st.session_state.pending_prompt = None
 
 knowledge_base = load_knowledge_base()
 kb_is_ready = not knowledge_base.startswith("ERROR")
+
+def process_prompt(prompt_text):
+    """Process a prompt (from chat input or button) and add response to history."""
+    st.session_state.messages.append({"role": "user", "content": prompt_text})
+    if kb_is_ready:
+        response = core.ask_host_helper(prompt_text, knowledge_base, chat_history=st.session_state.messages)
+        st.session_state.total_count += 1
+        if core.FALLBACK_RESPONSE in response:
+            st.session_state.unanswered_count += 1
+    else:
+        response = "System Error: KB not ready."
+    st.session_state.messages.append({"role": "assistant", "content": response})
 
 if not st.session_state.authenticated:
     st.markdown("<br><br>", unsafe_allow_html=True)
@@ -100,46 +112,35 @@ else:
         st.image(generate_qr_code(APP_URL), use_container_width=True)
         st.download_button(label="Download QR Code", data=generate_qr_code(APP_URL), file_name="host_helper_qr.png", mime="image/png")
 
+    # Show welcome and quick action buttons only if no chat yet
     if not st.session_state.messages:
         st.markdown("### Quick questions to get you started:")
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("📶 WiFi Password", use_container_width=True):
-                st.session_state.quick_action = "What is the WiFi password?"
-            if st.button("🏠 House Rules", use_container_width=True):
-                st.session_state.quick_action = "What are the house rules?"
+            if st.button("📶 WiFi Password", use_container_width=True, key="btn_wifi"):
+                process_prompt("What is the WiFi password?")
+                st.rerun()
+            if st.button("🏠 House Rules", use_container_width=True, key="btn_rules"):
+                process_prompt("What are the house rules?")
+                st.rerun()
         with col_b:
-            if st.button("🔑 Check-In Info", use_container_width=True):
-                st.session_state.quick_action = "How do I check in?"
-            if st.button("🍽️ Local Recs", use_container_width=True):
-                st.session_state.quick_action = "What are some good local restaurants?"
+            if st.button("🔑 Check-In Info", use_container_width=True, key="btn_checkin"):
+                process_prompt("How do I check in?")
+                st.rerun()
+            if st.button("🍽️ Local Recs", use_container_width=True, key="btn_food"):
+                process_prompt("What are some good local restaurants?")
+                st.rerun()
         st.markdown("---")
         st.markdown("**Or type your own question below:**")
-        st.session_state.messages.append({"role": "assistant", "content": "Hi there! I am your property assistant. Tap one of the quick questions above or just type your own — I am here 24/7 to help."})
+        st.chat_message("assistant", avatar="🏠").markdown("Hi there! I am your property assistant. Tap one of the quick questions above or just type your own — I am here 24/7 to help.")
+    else:
+        # Render full chat history
+        for message in st.session_state.messages:
+            avatar_icon = "🏠" if message["role"] == "assistant" else "👤"
+            with st.chat_message(message["role"], avatar=avatar_icon):
+                st.markdown(message["content"])
 
-    for message in st.session_state.messages:
-        avatar_icon = "🏠" if message["role"] == "assistant" else "👤"
-        with st.chat_message(message["role"], avatar=avatar_icon):
-            st.markdown(message["content"])
-
-    prompt = st.chat_input("Ask about WiFi, check-in, parking, anything...")
-    if st.session_state.quick_action:
-        prompt = st.session_state.quick_action
-        st.session_state.quick_action = None
-
-    if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user", avatar="👤"):
-            st.markdown(prompt)
-        with st.chat_message("assistant", avatar="🏠"):
-            with st.spinner("Checking property guide..."):
-                if kb_is_ready:
-                    response = core.ask_host_helper(prompt, knowledge_base, chat_history=st.session_state.messages)
-                    st.session_state.total_count += 1
-                    if core.FALLBACK_RESPONSE in response:
-                        st.session_state.unanswered_count += 1
-                else:
-                    response = "System Error: KB not ready."
-                st.markdown(response)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    # Chat input - always at the bottom
+    if prompt := st.chat_input("Ask about WiFi, check-in, parking, anything..."):
+        process_prompt(prompt)
         st.rerun()
