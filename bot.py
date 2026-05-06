@@ -8,6 +8,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import google.generativeai as genai
 import os
+import time
 import smtplib
 from email.mime.text import MIMEText
 from email.utils import formataddr
@@ -226,7 +227,21 @@ def ask_host_helper(question, kb_data, chat_history=None):
         return f"System Error: {kb_data}"
     full_prompt = build_prompt(question, kb_data, chat_history)
     try:
-        response = genai.GenerativeModel(MODEL).generate_content(full_prompt)
+        response = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = genai.GenerativeModel(MODEL).generate_content(full_prompt)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if "503" in str(e) or "overload" in str(e).lower():
+                    time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s backoff
+                    continue
+                raise
+        if last_error:
+            raise last_error
         ai_response = response.text
         if should_log(ai_response):
             log_unanswered_question(question)
@@ -244,7 +259,21 @@ def ask_host_helper_stream(question, kb_data, chat_history=None):
         return
     full_prompt = build_prompt(question, kb_data, chat_history)
     try:
-        response = genai.GenerativeModel(MODEL).generate_content(full_prompt, stream=True)
+        response = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = genai.GenerativeModel(MODEL).generate_content(full_prompt, stream=True)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if "503" in str(e) or "overload" in str(e).lower():
+                    time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s backoff
+                    continue
+                raise
+        if last_error:
+            raise last_error
         full_text = ""
         for chunk in response:
             if chunk.text:
