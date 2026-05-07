@@ -29,6 +29,33 @@ MODEL = "gemini-2.5-flash"
 
 FALLBACK_RESPONSE = "I'm sorry, I don't have that specific information. I will notify the host to help you with that."
 OFF_TOPIC_RESPONSE = "I'm here to help with questions about your stay. Is there anything about the property I can help with?"
+
+# === NEW: Hardcoded emergency response — never goes through Gemini ===
+EMERGENCY_RESPONSE = (
+    "If this is a medical or safety emergency, please call 911 immediately. "
+    "I'm also alerting the host right now and they will reach out as soon as possible."
+)
+
+# === NEW: Safe fallback when Gemini fails or is blocked ===
+SAFE_ERROR_RESPONSE = (
+    "I'm having trouble responding right now. "
+    "I'm alerting the host so they can follow up with you directly."
+)
+
+# === NEW: Emergency keywords — bypass AI entirely for safety-critical messages ===
+EMERGENCY_KEYWORDS = [
+    "hurt", "injured", "bleeding", "blood",
+    "fire", "smoke", "burning",
+    "gas leak", "carbon monoxide",
+    "ambulance", "911", "emergency",
+    "broken bone", "fell down", "fell and",
+    "can't breathe", "cant breathe", "choking",
+    "unconscious", "passed out",
+    "heart attack", "stroke", "seizure",
+    "intruder", "break in", "broke in",
+    "drowning", "drowned",
+]
+
 ESCALATION_PHRASES = [
     "alerting the host",
     "alert the host",
@@ -43,6 +70,46 @@ ESCALATION_PHRASES = [
     "reach out to the host",
     "message the host",
 ]
+
+
+# === NEW: Detect emergency in user message ===
+def is_emergency(question):
+    """Returns True if the user's message contains emergency keywords."""
+    if not question:
+        return False
+    q = question.lower()
+    return any(kw in q for kw in EMERGENCY_KEYWORDS)
+
+
+# === NEW: Safely extract text from a Gemini response, handling blocks/empties ===
+def safe_extract_text(response):
+    """
+    Returns the response text if the response is valid.
+    Returns None if the response was blocked, empty, or malformed.
+    Never raises.
+    """
+    try:
+        if not response:
+            return None
+        if not getattr(response, "candidates", None):
+            return None
+        candidate = response.candidates[0]
+        # finish_reason != 1 means non-normal stop (2=MAX_TOKENS, 3=SAFETY, 4=RECITATION, 5=OTHER)
+        # finish_reason == 1 means STOP (normal completion)
+        # We accept both 1 (STOP) and 2 (MAX_TOKENS, partial response is still usable)
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason not in (1, 2, None):
+            return None
+        content = getattr(candidate, "content", None)
+        if not content or not getattr(content, "parts", None):
+            return None
+        parts_text = "".join(
+            getattr(p, "text", "") for p in content.parts if getattr(p, "text", None)
+        )
+        return parts_text.strip() if parts_text else None
+    except Exception as e:
+        print(f"[SAFE_EXTRACT ERROR] {e}")
+        return None
 
 
 def should_log(response_text):
@@ -122,9 +189,11 @@ def send_sms_alert(question):
         return False
 
 
-def log_unanswered_question(question):
+# === MODIFIED: Added an optional context label so emergency logs are flagged ===
+def log_unanswered_question(question, context=""):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = [timestamp, question.strip()]
+    label = f"[{context}] {question.strip()}" if context else question.strip()
+    log_entry = [timestamp, label]
     try:
         client = get_gspread_client()
         if client:
@@ -132,8 +201,8 @@ def log_unanswered_question(question):
             sheet.append_row(log_entry)
     except Exception as e:
         print(f"[LOG ERROR] {e}")
-    send_email_alert(question)
-    send_sms_alert(question)
+    send_email_alert(label)
+    send_sms_alert(label)
 
 
 def get_knowledge_base():
@@ -170,22 +239,22 @@ def build_prompt(question, kb_data, chat_history=None):
         "## EXAMPLE 1 — Guest is uncomfortable\n"
         "Guest: 'It's freezing in here, the thermostat won't go below 65'\n"
         "BAD response: 'The thermostat can be adjusted between 68°F and 78°F.'\n"
-        "GOOD response: 'I'm sorry it's uncomfortable in there. The thermostat is set to operate between 68°F and 78°F, but if it's not cooling at all that may be a malfunction. I'm alerting the host now.'\n\n"
+        "GOOD response: 'I'm sorry it's uncomfortable in there. The thermostat is set to operate between 68°F and 78°F, but if it's not cooling at all that may be a malfunction. I am alerting the host now.'\n\n"
 
         "## EXAMPLE 2 — Guest reports something gross/broken\n"
         "Guest: 'The hot tub is gross, there's something floating in it'\n"
         "BAD response: 'Please message your host through your booking platform.'\n"
-        "GOOD response: 'That sounds unpleasant — I'm so sorry. Please avoid using the hot tub until it's been cleaned. I'm alerting the host now to take care of it.'\n\n"
+        "GOOD response: 'That sounds unpleasant — I'm so sorry. Please avoid using the hot tub until it has been cleaned. I am alerting the host now to take care of it.'\n\n"
 
         "## EXAMPLE 3 — Guest asks about visitors\n"
         "Guest: 'Can my mom and her boyfriend stay over Saturday?'\n"
         "BAD response: 'I'm sorry, I don't have that specific information.'\n"
-        "GOOD response: 'Our house rules don't allow unregistered guests, and the max occupancy is 8. If you'd like them to visit, I can let the host know to see if it can be approved. I'm alerting the host now.'\n\n"
+        "GOOD response: 'Great question! The house rules cap occupancy at 8 and ask that all guests be registered. I will send a note to the host now to ask about adding them — they will get back to you directly.'\n\n"
 
         "## EXAMPLE 4 — Guest is locked out\n"
         "Guest: 'We're locked out, the code isn't working'\n"
         "BAD response: 'The keypad code is 5678#.'\n"
-        "GOOD response: 'Sorry you're locked out — let's get you in. The keypad code is 5678#, and there's a backup key in the lockbox under the patio table. If neither works, call the property manager at (305) 555-0192. I'm alerting the host now.'\n\n"
+        "GOOD response: 'Sorry you are locked out — let's get you in. The keypad code is 5678#, and there is a backup key in the lockbox under the patio table. If neither works, call the property manager at (305) 555-0192. I am alerting the host now.'\n\n"
 
         "## EXAMPLE 5 — Simple factual question, no problem\n"
         "Guest: 'What's the WiFi password?'\n"
@@ -195,7 +264,7 @@ def build_prompt(question, kb_data, chat_history=None):
         "# YOUR THREE RULES\n"
         "1. EMPATHY FIRST when the guest reports a problem, frustration, or discomfort. Always start with a short empathetic acknowledgment ('Sorry about that —', 'That sounds frustrating —', 'I'm sorry it's uncomfortable —').\n"
         "2. INFER from the knowledge base. Many questions are restated policies (visitors → guest limits; late checkout → checkout time; loud music → quiet hours). Don't punt to fallback if the answer can be reasonably inferred from existing entries.\n"
-        "3. ESCALATE by ending with 'I'm alerting the host now.' whenever:\n"
+        "3. ESCALATE by ending with 'I am alerting the host now.' whenever:\n"
         "   - Anything is broken, dirty, gross, malfunctioning, leaking, or not working\n"
         "   - Guest is locked out or can't access something\n"
         "   - Thermostat/AC/heat won't reach desired temperature (this is a malfunction)\n"
@@ -203,6 +272,11 @@ def build_prompt(question, kb_data, chat_history=None):
         "   - Request needs host approval (extra guests, late checkout, early check-in, pets, events)\n"
         "   - Complaint, dispute, or refund request\n"
         "   When in doubt: escalate.\n\n"
+
+        "# FORMATTING — IMPORTANT\n"
+        "Never end a sentence with 'now.' followed immediately by uppercase letters or domain-like text. "
+        "Always write 'I am alerting the host now.' as a complete standalone sentence. "
+        "Do not use markdown links, brackets, or URL formatting in your responses.\n\n"
 
         "# KNOWLEDGE BASE CONSTRAINT\n"
         "Answer ONLY using info from the KNOWLEDGE BASE below. Never invent facts. "
@@ -228,8 +302,14 @@ def build_prompt(question, kb_data, chat_history=None):
     return f"{system_prompt}\n\nKNOWLEDGE BASE:\n{kb_data}\n\nCONVERSATION HISTORY:\n{history_text}\nGUEST QUESTION: {question}"
 
 
+# === MODIFIED: Added emergency override at top, safe extraction, safe error fallback ===
 def ask_host_helper(question, kb_data, chat_history=None):
     """Non-streaming version - returns full response as string."""
+    # === NEW: Emergency override — bypass AI entirely ===
+    if is_emergency(question):
+        log_unanswered_question(question, context="EMERGENCY")
+        return EMERGENCY_RESPONSE
+
     if kb_data.startswith("ERROR"):
         return f"System Error: {kb_data}"
     full_prompt = build_prompt(question, kb_data, chat_history)
@@ -244,23 +324,41 @@ def ask_host_helper(question, kb_data, chat_history=None):
             except Exception as e:
                 last_error = e
                 if "503" in str(e) or "overload" in str(e).lower():
-                    time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s backoff
+                    time.sleep(1.5 * (attempt + 1))
                     continue
                 raise
         if last_error:
             raise last_error
-        ai_response = response.text
+
+        # === MODIFIED: Use safe extraction instead of response.text ===
+        ai_response = safe_extract_text(response)
+        if not ai_response:
+            # Response was blocked or empty - log and return safe fallback
+            print(f"[GEMINI BLOCKED/EMPTY] Question: {question}")
+            log_unanswered_question(question, context="BLOCKED")
+            return SAFE_ERROR_RESPONSE
+
         if should_log(ai_response):
             log_unanswered_question(question)
         return ai_response
     except Exception as e:
+        print(f"[ASK_HOST_HELPER ERROR] {e}")
         if "API_KEY" in str(e) or "invalid API key" in str(e):
             return "AI Error: Your GEMINI_API_KEY is incorrect or not set."
-        return f"AI Error: Could not generate response. Details: {e}"
+        # === MODIFIED: Don't dump raw error to guest. Log it, return safe response. ===
+        log_unanswered_question(question, context="ERROR")
+        return SAFE_ERROR_RESPONSE
 
 
+# === MODIFIED: Same emergency override + safe streaming ===
 def ask_host_helper_stream(question, kb_data, chat_history=None):
-    """Streaming version - yields chunks as they arrive. Returns full text via generator."""
+    """Streaming version - yields chunks as they arrive."""
+    # === NEW: Emergency override — bypass AI entirely ===
+    if is_emergency(question):
+        log_unanswered_question(question, context="EMERGENCY")
+        yield EMERGENCY_RESPONSE
+        return
+
     if kb_data.startswith("ERROR"):
         yield f"System Error: {kb_data}"
         return
@@ -276,21 +374,36 @@ def ask_host_helper_stream(question, kb_data, chat_history=None):
             except Exception as e:
                 last_error = e
                 if "503" in str(e) or "overload" in str(e).lower():
-                    time.sleep(1.5 * (attempt + 1))  # 1.5s, 3s, 4.5s backoff
+                    time.sleep(1.5 * (attempt + 1))
                     continue
                 raise
         if last_error:
             raise last_error
+
         full_text = ""
+        chunks_yielded = False
         for chunk in response:
-            if chunk.text:
-                full_text += chunk.text
-                yield chunk.text
-        # After streaming completes, check if we should log this response
+            # === MODIFIED: Safe text extraction per chunk ===
+            chunk_text = safe_extract_text(chunk)
+            if chunk_text:
+                full_text += chunk_text
+                chunks_yielded = True
+                yield chunk_text
+
+        # === NEW: If nothing was yielded, send safe fallback ===
+        if not chunks_yielded or not full_text.strip():
+            print(f"[GEMINI STREAM BLOCKED/EMPTY] Question: {question}")
+            log_unanswered_question(question, context="BLOCKED")
+            yield SAFE_ERROR_RESPONSE
+            return
+
         if should_log(full_text):
             log_unanswered_question(question)
     except Exception as e:
+        print(f"[ASK_HOST_HELPER_STREAM ERROR] {e}")
         if "API_KEY" in str(e) or "invalid API key" in str(e):
             yield "AI Error: Your GEMINI_API_KEY is incorrect or not set."
         else:
-            yield f"AI Error: Could not generate response. Details: {e}"
+            # === MODIFIED: Don't dump raw error. Log it, return safe response. ===
+            log_unanswered_question(question, context="ERROR")
+            yield SAFE_ERROR_RESPONSE
