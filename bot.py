@@ -382,13 +382,25 @@ def ask_host_helper_stream(question, kb_data, chat_history=None):
 
         full_text = ""
         chunks_yielded = False
-        for chunk in response:
-            # === MODIFIED: Safe text extraction per chunk ===
-            chunk_text = safe_extract_text(chunk)
-            if chunk_text:
-                full_text += chunk_text
-                chunks_yielded = True
-                yield chunk_text
+        try:
+            for chunk in response:
+                # Streaming chunks have a different shape than full responses.
+                # Try direct .text access and skip chunks that don't have content.
+                try:
+                    chunk_text = chunk.text
+                except (ValueError, AttributeError):
+                    chunk_text = None
+                if chunk_text:
+                    full_text += chunk_text
+                    chunks_yielded = True
+                    yield chunk_text
+        except Exception as stream_err:
+            print(f"[STREAM CHUNK ERROR] {stream_err}")
+            # If streaming fails partway through, fall back to a single safe response
+            if not chunks_yielded:
+                log_unanswered_question(question, context="STREAM_ERROR")
+                yield SAFE_ERROR_RESPONSE
+                return
 
         # === NEW: If nothing was yielded, send safe fallback ===
         if not chunks_yielded or not full_text.strip():
