@@ -8,6 +8,7 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import google.generativeai as genai
 import os
+import re
 import time
 import smtplib
 from email.mime.text import MIMEText
@@ -30,19 +31,19 @@ MODEL = "gemini-2.5-flash"
 FALLBACK_RESPONSE = "I'm sorry, I don't have that specific information. I will notify the host to help you with that."
 OFF_TOPIC_RESPONSE = "I'm here to help with questions about your stay. Is there anything about the property I can help with?"
 
-# === NEW: Hardcoded emergency response — never goes through Gemini ===
+# === Hardcoded emergency response — never goes through Gemini ===
 EMERGENCY_RESPONSE = (
     "If this is a medical or safety emergency, please call 911 immediately. "
     "I'm also alerting the host right now and they will reach out as soon as possible."
 )
 
-# === NEW: Safe fallback when Gemini fails or is blocked ===
+# === Safe fallback when Gemini fails or is blocked ===
 SAFE_ERROR_RESPONSE = (
     "I'm having trouble responding right now. "
     "I'm alerting the host so they can follow up with you directly."
 )
 
-# === NEW: Emergency keywords — bypass AI entirely for safety-critical messages ===
+# === Emergency keywords — bypass AI entirely for safety-critical messages ===
 EMERGENCY_KEYWORDS = [
     "hurt", "injured", "bleeding", "blood",
     "fire", "smoke", "burning",
@@ -51,10 +52,37 @@ EMERGENCY_KEYWORDS = [
     "broken bone", "fell down", "fell and",
     "can't breathe", "cant breathe", "choking",
     "unconscious", "passed out",
-    "heart attack", "stroke", "seizure",
+    "heart attack", "a stroke", "seizure",
     "intruder", "break in", "broke in",
     "drowning", "drowned",
 ]
+
+# === Benign phrases that CONTAIN an emergency word but are NOT emergencies. ===
+# These are scrubbed from the message before keyword matching, so a question
+# about the fire pit or the smoke detector no longer tells a guest to call 911.
+# Keep this list lowercase. Order does not matter.
+EMERGENCY_FALSE_POSITIVES = [
+    # "fire" used as an amenity / object, not a fire
+    "fire pit", "firepit", "fire place", "fireplace", "campfire", "bonfire",
+    "fire extinguisher", "fire alarm", "fire escape", "fire department", "fire truck",
+    "fire tv", "fire stick", "firestick", "amazon fire", "fire hd",
+    # "smoke" used about the detector / policy, not actual smoke
+    "smoke detector", "smoke alarm", "smoke free", "smoking area", "smoking section",
+    "no smoking", "non smoking", "non-smoking", "nonsmoking", "smoke shop",
+    # "blood" / "burning" / "stroke" / "choking" in everyday phrases
+    "blood orange", "burning question", "stroke of", "breast stroke", "back stroke",
+    "side stroke", "butterfly stroke", "choking hazard",
+    # "broke in" meaning damaged, not an intruder
+    "broke in half", "broke in two",
+]
+
+
+def _scrub_false_positives(text):
+    """Remove known benign phrases so their embedded keywords don't trigger."""
+    for phrase in EMERGENCY_FALSE_POSITIVES:
+        text = text.replace(phrase, " ")
+    return text
+
 
 ESCALATION_PHRASES = [
     "alerting the host",
@@ -72,16 +100,105 @@ ESCALATION_PHRASES = [
 ]
 
 
-# === NEW: Detect emergency in user message ===
+# ======================================================================
+# === ISSUE TRIAGE FEATURE =============================================
+# ======================================================================
+# Every escalation is classified by severity so the host alert can be
+# routed appropriately. Email always fires; SMS (the intrusive channel)
+# is gated to urgent severities to prevent alert fatigue.
+
+SEVERITY_P0 = "P0_EMERGENCY"   # Safety/medical/fire/gas — keyword bypass, never LLM
+SEVERITY_P1 = "P1_URGENT"      # Habitability: locked out, no heat/AC, leak, no hot water
+SEVERITY_P2 = "P2_STANDARD"    # Needs host action/approval but not time-critical
+SEVERITY_P3 = "P3_INFO"        # Pure knowledge-base gap, no problem reported
+
+# Human-readable tags used in email subject lines / log rows.
+SEVERITY_LABELS = {
+    SEVERITY_P0: "EMERGENCY",
+    SEVERITY_P1: "URGENT",
+    SEVERITY_P2: "ACTION NEEDED",
+    SEVERITY_P3: "FYI - KB GAP",
+}
+
+# Only these severities trigger the intrusive SMS channel.
+SMS_SEVERITIES = {SEVERITY_P0, SEVERITY_P1}
+
+# Where classification lands when the triage LLM call fails or is ambiguous.
+# NOTE: P2 means "email only, no SMS." This is the low-noise default and is
+# correct WHILE SMS IS NOT YET LIVE. Once Twilio A2P 10DLC is approved and SMS
+# is active, reconsider flipping this to SEVERITY_P1 so a failed classification
+# errs toward over-alerting on genuinely urgent habitability issues.
+TRIAGE_FALLBACK_SEVERITY = SEVERITY_P2
+
+TRIAGE_PROMPT = (
+    "You are triaging a single guest message for a short-term rental host. "
+    "Assign exactly ONE severity category. Reply with ONLY the category code "
+    "(e.g. P1_URGENT) and nothing else.\n\n"
+    "P1_URGENT — the guest cannot safely or reasonably use the property right now: "
+    "locked out, no power, no heat or AC in extreme weather, no hot water, no running water, "
+    "water leak or flooding, a lock or door that won't secure, refrigerator dead, smoke detector "
+    "chirping.\n"
+    "P2_STANDARD — needs host action or approval but is NOT time-critical: extra-guest request, "
+    "late checkout or early check-in, minor maintenance (one light bulb, remote batteries), "
+    "a complaint, a refund or billing dispute, a non-essential amenity not working (hot tub jets, "
+    "ice maker, one of several TVs).\n"
+    "P3_INFO — no problem is reported; the assistant simply lacked the requested information "
+    "(a general question or a knowledge-base gap).\n\n"
+    'Guest message: "{question}"\n'
+    "Category:"
+)
+
+
+def classify_issue(question):
+    """
+    LLM-based triage. Returns one of the SEVERITY_* codes.
+    Runs ONLY on messages that are already being escalated, so the extra
+    Gemini call is incurred on a small fraction of traffic.
+    Never raises; falls back to TRIAGE_FALLBACK_SEVERITY on any failure.
+    """
+    if not question or not question.strip():
+        return TRIAGE_FALLBACK_SEVERITY
+    try:
+        prompt = TRIAGE_PROMPT.format(question=question.strip().replace('"', "'"))
+        resp = genai.GenerativeModel(MODEL).generate_content(prompt)
+        text = safe_extract_text(resp)
+        if not text:
+            return TRIAGE_FALLBACK_SEVERITY
+        text = text.strip().upper()
+        # Check most-urgent-first so a verbose model reply still maps cleanly.
+        for sev in (SEVERITY_P1, SEVERITY_P2, SEVERITY_P3):
+            if sev in text:
+                return sev
+        return TRIAGE_FALLBACK_SEVERITY
+    except Exception as e:
+        print(f"[TRIAGE ERROR] {e}")
+        return TRIAGE_FALLBACK_SEVERITY
+# ======================================================================
+
+
+# === Detect emergency in user message ===
 def is_emergency(question):
-    """Returns True if the user's message contains emergency keywords."""
+    """
+    Returns True if the message contains a genuine emergency keyword.
+
+    Two guards against false positives that previously sent guests a
+    'call 911' message over harmless questions:
+      1. Scrub known benign phrases first (fire pit, smoke detector, etc.).
+      2. Match on WORD BOUNDARIES so 'fire' no longer hits 'campfire'/'fireplace'
+         and 'blood' no longer hits 'bloody'.
+    Bias is intentionally toward catching real emergencies: anything not
+    explicitly excluded still triggers.
+    """
     if not question:
         return False
-    q = question.lower()
-    return any(kw in q for kw in EMERGENCY_KEYWORDS)
+    q = _scrub_false_positives(question.lower())
+    for kw in EMERGENCY_KEYWORDS:
+        if re.search(r"\b" + re.escape(kw) + r"\b", q):
+            return True
+    return False
 
 
-# === NEW: Safely extract text from a Gemini response, handling blocks/empties ===
+# === Safely extract text from a Gemini response, handling blocks/empties ===
 def safe_extract_text(response):
     """
     Returns the response text if the response is valid.
@@ -148,14 +265,33 @@ def get_pin(kb_data):
     return None
 
 
-def send_email_alert(question):
+# === MODIFIED: severity-aware subject line and body ===
+def send_email_alert(question, severity=None):
     try:
         import streamlit as st
         gmail_user = st.secrets["GMAIL_USER"]
         gmail_password = st.secrets["GMAIL_APP_PASSWORD"]
         host_email = st.secrets["HOST_EMAIL"]
-        subject = "Host Helper AI - Unanswered Guest Question"
-        body = f"A guest just asked your property bot a question it could not answer.\n\nQuestion: \"{question.strip()}\"\n\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nConsider adding this topic to your knowledge base so the bot can answer it next time.\n\n- Host Helper AI"
+
+        tag = SEVERITY_LABELS.get(severity, "GUEST MESSAGE")
+        subject = f"Host Helper AI [{tag}] - Guest message needs attention"
+
+        if severity in (SEVERITY_P0, SEVERITY_P1):
+            intro = "A guest reported something that may need your attention soon."
+        elif severity == SEVERITY_P3:
+            intro = "Your property bot could not answer a guest question."
+        else:
+            intro = "A guest message needs a host response or approval."
+
+        body = (
+            f"{intro}\n\n"
+            f"Severity: {tag}\n\n"
+            f"Message: \"{question.strip()}\"\n\n"
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"If this is a recurring question, consider adding it to your knowledge base "
+            f"so the bot can answer it next time.\n\n"
+            f"- Host Helper AI"
+        )
         msg = MIMEText(body)
         msg["Subject"] = subject
         msg["From"] = formataddr(("Host Helper AI", gmail_user))
@@ -169,7 +305,8 @@ def send_email_alert(question):
         return False
 
 
-def send_sms_alert(question):
+# === MODIFIED: severity-aware body prefix ===
+def send_sms_alert(question, severity=None):
     try:
         import streamlit as st
         sid = st.secrets["TWILIO_ACCOUNT_SID"]
@@ -178,8 +315,10 @@ def send_sms_alert(question):
         to_number = st.secrets["HOST_PHONE"]
         from twilio.rest import Client
         client = Client(sid, token)
+        tag = SEVERITY_LABELS.get(severity, "")
+        prefix = f"[{tag}] " if tag else ""
         message = client.messages.create(
-            body=f"Host Helper Alert: A guest asked:\n\"{question.strip()}\"\n\nUpdate your knowledge base.",
+            body=f"{prefix}Host Helper Alert: A guest said:\n\"{question.strip()}\"",
             from_=from_number,
             to=to_number
         )
@@ -189,11 +328,13 @@ def send_sms_alert(question):
         return False
 
 
-# === MODIFIED: Added an optional context label so emergency logs are flagged ===
-def log_unanswered_question(question, context=""):
+# === MODIFIED: added severity — logs a severity column and gates SMS by severity ===
+def log_unanswered_question(question, context="", severity=None):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     label = f"[{context}] {question.strip()}" if context else question.strip()
-    log_entry = [timestamp, label]
+    # Log row schema is now: timestamp | severity | message
+    # (existing 2-column rows remain valid; new rows simply add the column.)
+    log_entry = [timestamp, severity or "", label]
     try:
         client = get_gspread_client()
         if client:
@@ -201,8 +342,14 @@ def log_unanswered_question(question, context=""):
             sheet.append_row(log_entry)
     except Exception as e:
         print(f"[LOG ERROR] {e}")
-    send_email_alert(label)
-    send_sms_alert(label)
+
+    # Email always fires — it is the low-noise channel of record.
+    send_email_alert(label, severity=severity)
+
+    # SMS is intrusive: only fire it for urgent severities (or when severity
+    # is unknown, to preserve legacy behavior for any untriaged caller).
+    if severity is None or severity in SMS_SEVERITIES:
+        send_sms_alert(label, severity=severity)
 
 
 def get_knowledge_base():
@@ -302,12 +449,12 @@ def build_prompt(question, kb_data, chat_history=None):
     return f"{system_prompt}\n\nKNOWLEDGE BASE:\n{kb_data}\n\nCONVERSATION HISTORY:\n{history_text}\nGUEST QUESTION: {question}"
 
 
-# === MODIFIED: Added emergency override at top, safe extraction, safe error fallback ===
+# === MODIFIED: triage classification wired into every escalation path ===
 def ask_host_helper(question, kb_data, chat_history=None):
     """Non-streaming version - returns full response as string."""
-    # === NEW: Emergency override — bypass AI entirely ===
+    # Emergency override — bypass AI entirely, always P0.
     if is_emergency(question):
-        log_unanswered_question(question, context="EMERGENCY")
+        log_unanswered_question(question, context="EMERGENCY", severity=SEVERITY_P0)
         return EMERGENCY_RESPONSE
 
     if kb_data.startswith("ERROR"):
@@ -330,32 +477,32 @@ def ask_host_helper(question, kb_data, chat_history=None):
         if last_error:
             raise last_error
 
-        # === MODIFIED: Use safe extraction instead of response.text ===
         ai_response = safe_extract_text(response)
         if not ai_response:
             # Response was blocked or empty - log and return safe fallback
             print(f"[GEMINI BLOCKED/EMPTY] Question: {question}")
-            log_unanswered_question(question, context="BLOCKED")
+            log_unanswered_question(question, context="BLOCKED", severity=TRIAGE_FALLBACK_SEVERITY)
             return SAFE_ERROR_RESPONSE
 
         if should_log(ai_response):
-            log_unanswered_question(question)
+            # Triage the issue, then alert with the right severity/channel.
+            severity = classify_issue(question)
+            log_unanswered_question(question, severity=severity)
         return ai_response
     except Exception as e:
         print(f"[ASK_HOST_HELPER ERROR] {e}")
         if "API_KEY" in str(e) or "invalid API key" in str(e):
             return "AI Error: Your GEMINI_API_KEY is incorrect or not set."
-        # === MODIFIED: Don't dump raw error to guest. Log it, return safe response. ===
-        log_unanswered_question(question, context="ERROR")
+        log_unanswered_question(question, context="ERROR", severity=TRIAGE_FALLBACK_SEVERITY)
         return SAFE_ERROR_RESPONSE
 
 
-# === MODIFIED: Same emergency override + safe streaming ===
+# === MODIFIED: same triage wiring on the streaming path ===
 def ask_host_helper_stream(question, kb_data, chat_history=None):
     """Streaming version - yields chunks as they arrive."""
-    # === NEW: Emergency override — bypass AI entirely ===
+    # Emergency override — bypass AI entirely, always P0.
     if is_emergency(question):
-        log_unanswered_question(question, context="EMERGENCY")
+        log_unanswered_question(question, context="EMERGENCY", severity=SEVERITY_P0)
         yield EMERGENCY_RESPONSE
         return
 
@@ -398,24 +545,27 @@ def ask_host_helper_stream(question, kb_data, chat_history=None):
             print(f"[STREAM CHUNK ERROR] {stream_err}")
             # If streaming fails partway through, fall back to a single safe response
             if not chunks_yielded:
-                log_unanswered_question(question, context="STREAM_ERROR")
+                log_unanswered_question(question, context="STREAM_ERROR", severity=TRIAGE_FALLBACK_SEVERITY)
                 yield SAFE_ERROR_RESPONSE
                 return
 
-        # === NEW: If nothing was yielded, send safe fallback ===
+        # If nothing was yielded, send safe fallback
         if not chunks_yielded or not full_text.strip():
             print(f"[GEMINI STREAM BLOCKED/EMPTY] Question: {question}")
-            log_unanswered_question(question, context="BLOCKED")
+            log_unanswered_question(question, context="BLOCKED", severity=TRIAGE_FALLBACK_SEVERITY)
             yield SAFE_ERROR_RESPONSE
             return
 
         if should_log(full_text):
-            log_unanswered_question(question)
+            # Triage the issue, then alert with the right severity/channel.
+            # Runs after the guest has already received the full response, so
+            # the extra Gemini call adds no guest-facing latency.
+            severity = classify_issue(question)
+            log_unanswered_question(question, severity=severity)
     except Exception as e:
         print(f"[ASK_HOST_HELPER_STREAM ERROR] {e}")
         if "API_KEY" in str(e) or "invalid API key" in str(e):
             yield "AI Error: Your GEMINI_API_KEY is incorrect or not set."
         else:
-            # === MODIFIED: Don't dump raw error. Log it, return safe response. ===
-            log_unanswered_question(question, context="ERROR")
+            log_unanswered_question(question, context="ERROR", severity=TRIAGE_FALLBACK_SEVERITY)
             yield SAFE_ERROR_RESPONSE
