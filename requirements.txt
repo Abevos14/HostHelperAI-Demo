@@ -1,7 +1,7 @@
 streamlit
 gspread
 oauth2client
-google-generativeai
+google-genai
 python-dotenv
 twilio
 qrcode[pil]
